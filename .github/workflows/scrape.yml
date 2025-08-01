@@ -28,7 +28,7 @@ jobs:
         run: python job_scraper.py
 
       - name: Upload job_postings.csv
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: job-data
           path: job_postings.csv

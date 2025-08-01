@@ -1,34 +1,42 @@
 name: Run Job Scraper
 
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: "0 12 * * *"  # Daily at 12:00 UTC
+    - cron: "0 12 * * *"  # Every day at 12:00 UTC
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          playwright install
+    - name: Install dependencies
+      run: |
+        pip install playwright pandas
+        playwright install --with-deps chromium
 
-      - name: Run scraper
-        run: python job_scraper.py
+    - name: Run Dealer Scraper
+      run: python job_scraper.py
 
-      - name: Upload job_postings.csv
-        uses: actions/upload-artifact@v4
-        with:
-          name: job-data
-          path: job_postings.csv
+    - name: Run Indeed Scraper
+      run: python indeed_scraper.py
+
+    - name: Upload Dealer CSV
+      uses: actions/upload-artifact@v4
+      with:
+        name: dealer-postings
+        path: job_postings.csv
+
+    - name: Upload Indeed CSV
+      uses: actions/upload-artifact@v4
+      with:
+        name: indeed-postings
+        path: indeed_postings.csv

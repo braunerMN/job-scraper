@@ -1,21 +1,43 @@
+from playwright.sync_api import sync_playwright
 import pandas as pd
-from dealer_scrapers import argonne  # Add new dealers here
 
-def run_scrapers():
-    all_jobs = []
+def scrape_argonne():
+    url = "https://www.argonnelumber.com/employment"
+    job_list = []
 
-    # Call each dealer's scraper
-    all_jobs.extend(argonne.scrape())
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
+        print(f"Navigating to {url}")
+        page.goto(url, timeout=60000)
+        
+        # Wait for the page and job elements to load
+        page.wait_for_timeout(5000)  # Wait 5 seconds for JS content
+        print("Page loaded. Dumping content length:", len(page.content()))
 
-    # Future: add other dealers here
-    # from dealer_scrapers import another_dealer
-    # all_jobs.extend(another_dealer.scrape())
+        # Try selecting common Wix dynamic job elements
+        job_elements = page.query_selector_all("h2:has-text('Now Hiring'), h3:has-text('Now Hiring')")
+        print(f"Found {len(job_elements)} job headers")
 
-    # Save to CSV
-    df = pd.DataFrame(all_jobs)
-    df.to_csv("job_postings.csv", index=False)
-    print(f"Scraped {len(df)} jobs.")
+        for el in job_elements:
+            title = el.inner_text().strip()
+            parent = el.evaluate_handle("node => node.closest('section')")
+            text = parent.inner_text().strip() if parent else ""
+            job_list.append({
+                "title": title,
+                "description": text,
+                "source": url
+            })
+
+        browser.close()
+
+    if job_list:
+        df = pd.DataFrame(job_list)
+        df.to_csv("job_postings.csv", index=False)
+        print(f"Wrote {len(df)} jobs to job_postings.csv")
+    else:
+        print("⚠️ No jobs found — inspect the HTML or adjust the selector.")
 
 if __name__ == "__main__":
-    run_scrapers()
- 
+    scrape_argonne()

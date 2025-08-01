@@ -27,9 +27,11 @@ jobs:
         run: python job_scraper.py
 
       - name: Commit and push results
-        run: |
-          git config --global user.name 'github-actions'
-          git config --global user.email 'github-actions@github.com'
-          git add job_postings.csv
-          git commit -m "Update job postings" || echo "No changes"
-          git push
+  run: |
+    git config user.name github-actions
+    git config user.email github-actions@github.com
+    git add job_postings.csv
+    git commit -m "Update job postings" || echo "No changes"
+    git push
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

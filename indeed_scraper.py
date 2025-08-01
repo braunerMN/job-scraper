@@ -1,59 +1,58 @@
-from playwright.sync_api import sync_playwright
 import pandas as pd
-import time
+from playwright.sync_api import sync_playwright
 
-def scrape_indeed(company_name="Curtis Lumber"):
-    query = company_name.replace(" ", "+")
-    url = f"https://www.indeed.com/jobs?q=company%3A%22{query}%22&l="
+def scrape_indeed(company_name="Curtis Lumber", location=""):
+    print("🚀 Starting Indeed scraper...")
 
     jobs = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        print(f"Navigating to: {url}")
-        page.goto(url, timeout=60000)
-        page.wait_for_timeout(5000)  # Let JS render
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-        job_cards = page.query_selector_all("div.job_seen_beacon")
+            # Build search URL
+            base_url = "https://www.indeed.com/jobs"
+            query = f"?q={company_name.replace(' ', '+')}"
+            if location:
+                query += f"&l={location.replace(' ', '+')}"
+            url = base_url + query
+            print(f"🌐 Navigating to: {url}")
+            page.goto(url, timeout=60000)
 
-        for card in job_cards:
-            title_el = card.query_selector("h2.jobTitle")
-            title = title_el.inner_text().strip() if title_el else "N/A"
+            page.wait_for_selector("a.tapItem", timeout=10000)
+            job_cards = page.query_selector_all("a.tapItem")
 
-            company_el = card.query_selector("span.companyName")
-            company = company_el.inner_text().strip() if company_el else company_name
+            for job in job_cards:
+                try:
+                    title = job.query_selector("h2.jobTitle").inner_text().strip()
+                    company = job.query_selector("span.companyName").inner_text().strip()
+                    location = job.query_selector("div.companyLocation").inner_text().strip()
+                    link = job.get_attribute("href")
+                    job_url = f"https://www.indeed.com{link}" if link else ""
 
-            loc_el = card.query_selector("div.companyLocation")
-            location = loc_el.inner_text().strip() if loc_el else "N/A"
+                    jobs.append({
+                        "Job Title": title,
+                        "Company": company,
+                        "Location": location,
+                        "Link": job_url
+                    })
+                except Exception as e:
+                    print(f"⚠️ Error parsing job card: {e}")
 
-            summary_el = card.query_selector("div.job-snippet")
-            summary = summary_el.inner_text().strip().replace("\n", " ") if summary_el else "N/A"
+            browser.close()
 
-            link_el = card.query_selector("a")
-            href = link_el.get_attribute("href") if link_el else ""
-            link = f"https://www.indeed.com{href}" if href else "N/A"
+        print(f"🛠 Scraped {len(jobs)} jobs.")
 
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": location,
-                "description": summary,
-                "url": link,
-                "source": "Indeed"
-            })
+        if jobs:
+            df = pd.DataFrame(jobs)
+            df.to_csv("indeed_postings.csv", index=False)
+            print(f"✅ Saved {len(df)} jobs to indeed_postings.csv")
+        else:
+            print("⚠️ No jobs found on Indeed.")
 
-        browser.close()
-
-    # Save or return
-    print(f"🛠 Scraped {len(jobs)} jobs.")
-
-    if jobs:
-        df = pd.DataFrame(jobs)
-        df.to_csv("indeed_postings.csv", index=False)
-        print(f"Saved {len(df)} jobs to indeed_postings.csv")
-    else:
-        print("⚠️ No jobs found on Indeed.")
+    except Exception as e:
+        print(f"❌ Error during scraping: {e}")
 
 if __name__ == "__main__":
     scrape_indeed("Curtis Lumber")

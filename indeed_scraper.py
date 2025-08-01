@@ -47,6 +47,13 @@ def scrape_indeed(company_name="Curtis Lumber"):
 
     # Save or return
     print(f"🛠 Scraped {len(jobs)} jobs.")
+if jobs:
+    df = pd.DataFrame(jobs)
+    df.to_csv("indeed_postings.csv", index=False)
+    print(f"✅ Saved {len(df)} jobs to indeed_postings.csv")
+else:
+    print("⚠️ No jobs found on Indeed.")
+
 
     if jobs:
         df = pd.DataFrame(jobs)

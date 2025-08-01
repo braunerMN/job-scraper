@@ -8,36 +8,44 @@ def scrape_argonne():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        
+
         print(f"Navigating to {url}")
         page.goto(url, timeout=60000)
-        
-        # Wait for the page and job elements to load
-        page.wait_for_timeout(5000)  # Wait 5 seconds for JS content
-        print("Page loaded. Dumping content length:", len(page.content()))
+        page.wait_for_timeout(6000)
 
-        # Try selecting common Wix dynamic job elements
-        job_elements = page.query_selector_all("h2:has-text('Now Hiring'), h3:has-text('Now Hiring')")
-        print(f"Found {len(job_elements)} job headers")
+        print("Page loaded. Extracting job-related content...")
 
-        for el in job_elements:
-            title = el.inner_text().strip()
-            parent = el.evaluate_handle("node => node.closest('section')")
-            text = parent.inner_text().strip() if parent else ""
-            job_list.append({
-                "title": title,
-                "description": text,
-                "source": url
-            })
+        # Grab all visible text blocks (paragraphs, divs, spans)
+        elements = page.query_selector_all("p, span, div")
+
+        current_job = {}
+        for el in elements:
+            text = el.inner_text().strip()
+            if not text or len(text) < 5:
+                continue
+
+            if any(keyword in text.lower() for keyword in ["now hiring", "position", "job", "career", "opportunity", "join our team"]):
+                if current_job:
+                    job_list.append(current_job)
+                    current_job = {}
+
+                current_job["title"] = text
+                current_job["source"] = url
+                current_job["description"] = ""
+            elif current_job:
+                current_job["description"] += text + "\n"
+
+        if current_job:
+            job_list.append(current_job)
 
         browser.close()
 
     if job_list:
         df = pd.DataFrame(job_list)
         df.to_csv("job_postings.csv", index=False)
-        print(f"Wrote {len(df)} jobs to job_postings.csv")
+        print(f"✅ Wrote {len(df)} job(s) to job_postings.csv")
     else:
-        print("⚠️ No jobs found — inspect the HTML or adjust the selector.")
+        print("⚠️ No job content matched. Inspect raw page or broaden keyword search.")
 
 if __name__ == "__main__":
     scrape_argonne()

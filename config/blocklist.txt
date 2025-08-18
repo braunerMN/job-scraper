@@ -1,0 +1,11 @@
+# lines starting with # are comments
+open positions
+we are hiring
+hiring
+join our mailing list
+click to apply
+apply now
+newsletter
+benefits
+privacy policy
+terms of service

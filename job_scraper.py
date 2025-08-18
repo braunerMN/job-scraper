@@ -38,12 +38,21 @@ def make_job_key(j: dict) -> str:
 
 # ------------------ blocklist loader ------------------
 DEFAULT_BLOCKLIST = [
+    # generic non-job text
     "open positions", "we are hiring", "hiring", "join our mailing list",
     "join our newsletter", "click to apply", "apply now", "benefits",
     "about us", "mission statement", "equal opportunity", "contact us",
     "locations", "hours", "privacy policy", "terms of service",
-    "subscribe", "sign up", "follow us", "news", "events", "sales event",
-    "promotion", "coupon", "contest", "sweepstakes", "blog", "press"
+    "subscribe", "sign up", "follow us", "news", "events",
+    "sales event", "promotion", "coupon", "contest", "sweepstakes",
+    "blog", "press",
+
+    # footer/legal/junk
+    "accessibility statement", "terms of use", "all rights reserved",
+    "powered by", "copyright", "©",
+
+    # application prompts
+    "employment application", "download", "application", "apply online"
 ]
 
 def load_blocklist() -> list[str]:
@@ -61,31 +70,71 @@ def load_blocklist() -> list[str]:
 BLOCKLIST = load_blocklist()
 
 # ------------------ filtering with reasons ------------------
-UPPER_RE = re.compile(r"^[^a-z]*$")  # title has no lowercase letters
+PHONE_RE = re.compile(r'\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})\b')
+EMAIL_RE = re.compile(r'\b\S+@\S+\.\S+\b')
+URL_RE = re.compile(r'https?://|www\.')
+UPPER_RE = re.compile(r'^[^a-z]*$')  # title has no lowercase letters
+
+def is_titlecase_like(title: str) -> bool:
+    """
+    Accept if at least ~50% of words are Title Case or acronyms (e.g., CDL).
+    Helps keep 'Sales Position', 'Boom Truck Driver' and reject long sentences.
+    """
+    words = [w for w in re.split(r'\s+', title) if w]
+    if not words:
+        return False
+
+    def ok(w: str) -> bool:
+        if re.fullmatch(r'[A-Z]{2,5}', w):  # acronyms like CDL, HVAC
+            return True
+        # "Title-Case" or Title-Case hyphenated
+        return re.fullmatch(r'[A-Z][a-z]+(?:-[A-Z][a-z]+)?', w) is not None
+
+    hits = sum(1 for w in words if ok(w))
+    return hits >= max(1, len(words) // 2)
 
 def filter_with_reason(title: str, description: str = "") -> tuple[bool, str]:
     """
     Return (keep, reason_if_rejected).
-    Blocklist-only + simple structure checks.
+    Blocklist-first + structural checks (no required job keywords).
     """
     title = (title or "").strip()
     desc = (description or "").strip()
     tl = title.lower()
     dl = desc.lower()
 
+    # short / one-word headers
     if len(tl) < 5:
         return (False, "too_short")
     if len(title.split()) < 2:
         return (False, "one_word_header")
 
-    # if title is mostly shouting (no lowercase) and very short → header
+    # contact/footer/junk
+    if PHONE_RE.search(title) or EMAIL_RE.search(title) or URL_RE.search(title):
+        return (False, "contact_info")
+    if re.search(r'\binc\.?\b|\bllc\b|\bcorp\.?\b', tl):
+        return (False, "company_name")
+
+    # obvious headers
     if UPPER_RE.match(title) and len(title.split()) <= 3:
         return (False, "all_caps_header")
 
-    # blocklist phrases in title or description
+    # sentences (not titles): long + terminal punctuation
+    if title.endswith(('.', '!', '?')) and len(title.split()) >= 6:
+        return (False, "sentence_like")
+
+    # blocklist phrases anywhere in title or description
     for phrase in BLOCKLIST:
         if phrase in tl or phrase in dl:
             return (False, f"block:{phrase}")
+
+    # requirement-only lines like "CDL Required", "Experience Required"
+    if "required" in tl and len(title.split()) <= 3:
+        return (False, "requirement_only")
+
+    # shape: if it's not title-like and it's long, reject
+    if not is_titlecase_like(title) and len(title.split()) > 5:
+        return (False, "not_title_like")
 
     return (True, "")
 
@@ -130,41 +179,75 @@ def scrape_indeed(page, company: str) -> list[dict]:
     print(f"   indeed raw: {len(jobs)}")
     return jobs
 
+def _wix_find_relevant_section(page) -> list:
+    """
+    Heuristic: find the first container that mentions careers/employment/positions,
+    then search only inside it to reduce noise like footers, nav, newsletter.
+    """
+    signals = ["career", "careers", "employment", "jobs", "now hiring", "open positions", "positions", "apply"]
+    containers = page.query_selector_all("section, div, main") or []
+    for el in containers:
+        try:
+            txt = (el.inner_text() or "").lower()
+        except:
+            txt = ""
+        if not txt:
+            continue
+        if any(s in txt for s in signals):
+            return [el]
+    return []
+
 def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
-    """Heuristic Wix scraper—evaluate each line in likely content blocks."""
+    """
+    Wix scraper: limit scope to a relevant section, then collect candidate titles from
+    headings (h1..h6), list items, and short paragraphs/links; apply strict filters later.
+    """
     print(f"🌐 Wix → {company} → {url}")
     jobs: list[dict] = []
     page.goto(url, timeout=60000)
-    time.sleep(5)
+    time.sleep(5)  # allow JS to render
 
-    containers = ['[data-hook="richTextElement"]', '[data-testid="richTextElement"]', 'section', 'div']
-    for sel in containers:
-        for el in page.query_selector_all(sel):
-            try:
-                block = (el.inner_text() or "").strip()
-            except:
-                block = ""
-            if not block:
-                continue
+    # 1) Restrict to relevant section(s)
+    scopes = _wix_find_relevant_section(page)
+    if not scopes:
+        scopes = [page]  # fallback: whole page (filters will clean)
 
-            # Consider each non-empty line as a candidate title
-            for raw_line in block.split("\n"):
-                line = raw_line.strip()
+    # 2) Within scope, gather candidate elements
+    selectors = [
+        "h1", "h2", "h3", "h4",
+        "ul li", "ol li",
+        "[data-hook='richTextElement'] p",
+        "[data-testid='richTextElement'] p",
+        "a[data-testid='linkElement'] span",
+        "p"
+    ]
+
+    for scope in scopes:
+        for sel in selectors:
+            els = scope.query_selector_all(sel) or []
+            for el in els:
+                try:
+                    txt = (el.inner_text() or "").strip()
+                except:
+                    txt = ""
+                if not txt:
+                    continue
+
+                # Consider only the first line of multi-line blocks here
+                line = txt.split("\n")[0].strip()
                 if not line:
                     continue
+
                 jobs.append({
                     "company": company,
                     "source": "Website (Wix)",
                     "title": line,
                     "location": "",
                     "url": url,
-                    "description": block[:400]  # brief context for filtering
+                    "description": txt[:400]
                 })
 
-        if jobs:
-            break
-
-    print(f"   wix raw lines: {len(jobs)}")
+    print(f"   wix raw candidates: {len(jobs)}")
     return jobs
 
 def scrape_custom_static(page, url: str, company: str,
@@ -316,6 +399,9 @@ def run_all():
         title = j.get("title", "")
         desc = j.get("description", "")
         if keep_row(title, desc, record_rejection):
+            # drop the temporary description field from final CSV if present
+            if "description" in j:
+                j = {k: v for k, v in j.items() if k != "description"}
             filtered.append(j)
 
     # Save outputs

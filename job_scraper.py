@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import pandas as pd
 from datetime import datetime
@@ -16,6 +17,7 @@ STATE_CSV = os.path.join(OUT_DIR, "state.csv")
 AGED_CSV = os.path.join(OUT_DIR, "aged_jobs.csv")
 REJECTIONS_CSV = os.path.join(OUT_DIR, "rejections.csv")
 DEBUG_WIX_CSV = os.path.join(OUT_DIR, "debug_wix_candidates.csv")
+DEBUG_WIX_NET_CSV = os.path.join(OUT_DIR, "debug_wix_network_items.csv")
 
 # ------------------ utils ------------------
 def ensure_dirs():
@@ -47,11 +49,9 @@ DEFAULT_BLOCKLIST = [
     "subscribe", "sign up", "follow us", "news", "events",
     "sales event", "promotion", "coupon", "contest", "sweepstakes",
     "blog", "press",
-
     # footer/legal/junk
     "accessibility statement", "terms of use", "all rights reserved",
     "powered by", "copyright", "©",
-
     # application prompts
     "employment application", "download application", "apply online",
     "apply here", "print application"
@@ -77,61 +77,48 @@ URL_RE = re.compile(r'https?://|www\.')
 UPPER_RE = re.compile(r'^[^a-z]*$')  # no lowercase letters
 
 def is_titlecase_like(title: str) -> bool:
-    """
-    Accept if at least ~50% of words are Title Case or acronyms (CDL/HVAC).
-    Helps keep 'Sales Position', 'Boom Truck Driver' and reject long sentences.
-    """
+    """Accept if ~50% of words are Title Case or acronyms (CDL/HVAC)."""
     words = [w for w in re.split(r'\s+', title) if w]
     if not words:
         return False
-
     def ok(w: str) -> bool:
         if re.fullmatch(r'[A-Z]{2,5}', w):  # CDL, HVAC
             return True
         return re.fullmatch(r'[A-Z][a-z]+(?:-[A-Z][a-z]+)?', w) is not None
-
     hits = sum(1 for w in words if ok(w))
     return hits >= max(1, len(words) // 2)
 
 def filter_with_reason(title: str, description: str = "") -> tuple[bool, str]:
-    """
-    Blocklist-first + structural checks.
-    """
+    """Blocklist-first + structural checks."""
     title = (title or "").strip()
     desc = (description or "").strip()
     tl = title.lower()
     dl = desc.lower()
 
-    # short / one-word headers
     if len(tl) < 5:
         return (False, "too_short")
     if len(title.split()) < 2:
         return (False, "one_word_header")
 
-    # contact/footer/junk
     if PHONE_RE.search(title) or EMAIL_RE.search(title) or URL_RE.search(title):
         return (False, "contact_info")
     if re.search(r'\binc\.?\b|\bllc\b|\bcorp\.?\b', tl):
         return (False, "company_name")
 
-    # obvious headers
     if UPPER_RE.match(title) and len(title.split()) <= 3:
         return (False, "all_caps_header")
 
-    # sentences (not titles): long + terminal punctuation
+    # long sentences ending with punctuation likely not titles
     if title.endswith(('.', '!', '?')) and len(title.split()) >= 6:
         return (False, "sentence_like")
 
-    # blocklist phrases anywhere in title or description
     for phrase in BLOCKLIST:
         if phrase in tl or phrase in dl:
             return (False, f"block:{phrase}")
 
-    # requirement-only lines like "CDL Required" or "Experience Required"
     if "required" in tl and len(title.split()) <= 3:
         return (False, "requirement_only")
 
-    # shape: if it's not title-like and it's long, reject
     if not is_titlecase_like(title) and len(title.split()) > 6:
         return (False, "not_title_like")
 
@@ -143,53 +130,49 @@ def keep_row(title: str, description: str = "", record_rejection=None) -> bool:
         record_rejection(title, description, reason)
     return keep
 
-# ------------------ WIX helpers (tight) ------------------
+# ------------------ Wix helpers ------------------
 VERB_STOPWORDS = {
     "apply", "click", "join", "subscribe", "sign", "learn", "contact",
     "visit", "shop", "buy", "call", "email", "download", "view", "read", "follow"
 }
-
 ROLE_HINTS = {"driver","sales","yard","counter","associate","technician","foreman",
               "laborer","warehouse","estimator","designer","manager","supervisor",
               "cdl","delivery","purchasing","millwork","inside sales","outside sales"}
 
-def _wix_find_relevant_sections(page) -> list:
-    """
-    Find containers that mention careers/employment/positions to reduce noise
-    (nav/footer/newsletter). Fallback to whole page if none found.
-    """
-    signals = ["career", "careers", "employment", "jobs", "now hiring", "open positions", "positions", "apply"]
-    containers = page.query_selector_all("main, section, div") or []
-    ranked = []
-    for el in containers:
+def _auto_scroll(page, max_steps=15, step_px=1200, wait_s=0.6):
+    """Scroll to bottom progressively to trigger lazy loading."""
+    for _ in range(max_steps):
+        page.evaluate(f"window.scrollBy(0, {step_px});")
+        time.sleep(wait_s)
+
+def _try_click_load_more(page):
+    """Click load more buttons that Wix datasets often wire up."""
+    texts = ["load more", "more jobs", "see more", "show more"]
+    buttons = page.query_selector_all("button, a[role='button']")
+    clicked = 0
+    for b in buttons:
         try:
-            txt = (el.inner_text() or "").lower()
+            t = (b.inner_text() or "").strip().lower()
         except:
-            txt = ""
-        if not txt:
-            continue
-        score = sum(1 for s in signals if s in txt)
-        if score:
-            ranked.append((score, el))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [el for _, el in ranked[:3]] or [page]  # top 1-3 relevant, else whole page
+            t = ""
+        if any(x in t for x in texts):
+            try:
+                b.click()
+                time.sleep(1.0)
+                clicked += 1
+            except:
+                pass
+    return clicked
 
 def _looks_like_job_title(line: str) -> bool:
-    """
-    Pre-filter for Wix candidates before full filtering:
-    - 2..6 words
-    - <= 48 chars
-    - not all-caps short headers
-    - no obvious CTA verbs at start
-    - has lowercase or TitleCase pattern
-    """
+    """Pre-filter for Wix candidates."""
     if not line:
         return False
     line = line.strip()
-    if len(line) > 48:
+    if len(line) > 64:
         return False
     words = [w for w in re.split(r'\s+', line) if w]
-    if len(words) < 2 or len(words) > 6:
+    if len(words) < 2 or len(words) > 7:
         return False
     if UPPER_RE.match(line) and len(words) <= 3:
         return False
@@ -199,6 +182,28 @@ def _looks_like_job_title(line: str) -> bool:
     if not any(ch.islower() for ch in line) and not re.search(r'\b[A-Z][a-z]+', line):
         return False
     return True
+
+def _mine_json_for_titles(obj):
+    """Recursively walk JSON and pull probable titles."""
+    titles = []
+    def walk(x):
+        if isinstance(x, dict):
+            # Common field hints used by Wix CMS / Repeater bindings
+            for k, v in x.items():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+                else:
+                    if isinstance(v, str):
+                        ks = k.lower()
+                        if any(h in ks for h in ["title","job","position","role","name","heading"]):
+                            val = v.strip()
+                            if val and _looks_like_job_title(val):
+                                titles.append(val)
+        elif isinstance(x, list):
+            for it in x:
+                walk(it)
+    walk(obj)
+    return titles
 
 # ------------------ platform scrapers ------------------
 def scrape_indeed(page, company: str) -> list[dict]:
@@ -215,7 +220,6 @@ def scrape_indeed(page, company: str) -> list[dict]:
     for c in page.query_selector_all("a.tapItem"):
         try:
             t = c.query_selector("h2.jobTitle")
-            comp = c.query_selector("span.companyName")
             loc = c.query_selector("div.companyLocation")
             href = c.get_attribute("href") or ""
             link = "https://www.indeed.com" + href if href.startswith("/") else href
@@ -236,26 +240,60 @@ def scrape_indeed(page, company: str) -> list[dict]:
 
 def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
     """
-    Wix scraper: restrict scope, extract headings/list items/link text only,
-    pre-filter candidates, then apply central filter later.
+    Wix scraper:
+      1) attach network listeners to capture JSON from CMS/datasets
+      2) goto page, click 'load more', auto-scroll
+      3) collect candidate titles from headings/list/link text in careers-like sections
+      4) merge with any titles mined from JSON responses
     """
     print(f"🌐 Wix → {company} → {url}")
     raw: list[dict] = []
-    page.goto(url, timeout=60000)
-    time.sleep(5)
+    net_titles = []
 
-    scopes = _wix_find_relevant_sections(page)
+    # 1) network capture
+    def on_response(resp):
+        try:
+            u = resp.url
+            # Likely data endpoints used by Wix CMS/repeaters
+            if any(s in u for s in ["/_api/", "/_api/cms", "wix-data", "wixapps", "wixsite"]):
+                ct = resp.headers.get("content-type","").lower()
+                if "application/json" in ct:
+                    data = resp.json()
+                    mined = _mine_json_for_titles(data)
+                    for t in mined:
+                        net_titles.append(t)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+    page.goto(url, timeout=60000)
+    # give JS a moment
+    page.wait_for_load_state("networkidle", timeout=30000)
+    time.sleep(2)
+
+    # 2) expand content
+    for _ in range(3):
+        _try_click_load_more(page)
+        _auto_scroll(page, max_steps=6, step_px=1400, wait_s=0.5)
+
+    # 3) DOM candidates (only headings/list/link text)
+    scopes = page.query_selector_all("main, section, div") or []
     selectors = [
         "h1", "h2", "h3", "h4",
         "ul li", "ol li",
         "a[data-testid='linkElement'] span",
         "a[role='link'] span",
+        "a[data-testid='linkElement']",
+        "a[role='link']"
     ]
 
-    for scope in scopes:
+    for scope in scopes[:10]:  # limit breadth
+        txt_scope = (scope.inner_text() or "").lower()
+        if not any(sig in txt_scope for sig in ["career","careers","employment","jobs","positions","apply","opportunities"]):
+            continue
         for sel in selectors:
-            els = scope.query_selector_all(sel) or []
-            for el in els:
+            for el in scope.query_selector_all(sel) or []:
                 try:
                     txt = (el.inner_text() or "").strip()
                 except:
@@ -263,40 +301,29 @@ def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
                 if not txt:
                     continue
                 line = txt.split("\n")[0].strip()
-                if not _looks_like_job_title(line):
-                    continue
-                raw.append({
-                    "company": company,
-                    "source": "Website (Wix)",
-                    "title": line,
-                    "location": "",
-                    "url": url,
-                    "description": txt[:400]
-                })
+                if _looks_like_job_title(line):
+                    raw.append({
+                        "company": company,
+                        "source": "Website (Wix)",
+                        "title": line,
+                        "location": "",
+                        "url": url,
+                        "description": txt[:400]
+                    })
 
-    # Fallback: if we found nothing, scan headings again and keep ones with role hints
-    if not raw:
-        headings = page.query_selector_all("h1, h2, h3, h4") or []
-        for h in headings:
-            try:
-                line = (h.inner_text() or "").strip()
-            except:
-                line = ""
-            if not line:
-                continue
-            lo = line.lower()
-            if any(w in lo for w in ROLE_HINTS) and _looks_like_job_title(line):
-                raw.append({
-                    "company": company,
-                    "source": "Website (Wix)",
-                    "title": line,
-                    "location": "",
-                    "url": url,
-                    "description": line
-                })
+    # 4) merge network-mined titles
+    for t in net_titles:
+        raw.append({
+            "company": company,
+            "source": "Website (Wix, net)",
+            "title": t,
+            "location": "",
+            "url": url,
+            "description": ""
+        })
 
-    print(f"   wix candidates: {len(raw)}")
-    return raw  # final filtering happens centrally
+    print(f"   wix candidates (DOM+net): {len(raw)}  | net_titles: {len(net_titles)}")
+    return raw  # central filter handles quality
 
 def scrape_custom_static(page, url: str, company: str,
                          sel_card: str, sel_title: str, sel_loc: str, sel_link: str) -> list[dict]:
@@ -333,7 +360,6 @@ def scrape_lever(page, url: str, company: str) -> list[dict]:
     jobs: list[dict] = []
     page.goto(url, timeout=60000)
     time.sleep(2)
-
     postings = page.query_selector_all(".posting a, .posting-title a, a.posting-title")
     for a in postings:
         try:
@@ -351,7 +377,6 @@ def scrape_greenhouse(page, url: str, company: str) -> list[dict]:
     jobs: list[dict] = []
     page.goto(url, timeout=60000)
     time.sleep(2)
-
     postings = page.query_selector_all("section.opening a, .opening a, .opening a[href]")
     for a in postings:
         try:
@@ -369,7 +394,6 @@ def scrape_bamboohr(page, url: str, company: str) -> list[dict]:
     jobs: list[dict] = []
     page.goto(url, timeout=60000)
     time.sleep(2)
-
     postings = page.query_selector_all(".opening a, .jobTitle a, a[href*='bamboohr.com/jobs']")
     for a in postings:
         try:
@@ -392,6 +416,7 @@ def run_all():
     sources = pd.read_csv(LOADSHEET).fillna("")
     raw_rows: list[dict] = []
     wix_debug_rows = []
+    wix_net_rows = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -466,10 +491,13 @@ def run_all():
     pd.DataFrame(filtered).to_csv(POSTINGS_CSV, index=False)
     pd.DataFrame(rejections).to_csv(REJECTIONS_CSV, index=False)
     pd.DataFrame(wix_debug_rows).to_csv(DEBUG_WIX_CSV, index=False)
+    # Placeholder for network mined rows if you later store them separately
+    pd.DataFrame(wix_net_rows).to_csv(DEBUG_WIX_NET_CSV, index=False)
 
     print(f"✅ Wrote {len(filtered)} filtered rows (from {len(uniq)} raw) → {POSTINGS_CSV}")
     print(f"🧹 Rejections saved → {REJECTIONS_CSV} ({len(rejections)} rows)")
     print(f"🔍 Wix candidates saved → {DEBUG_WIX_CSV} ({len(wix_debug_rows)} rows)")
+    print(f"🔎 Wix network items saved → {DEBUG_WIX_NET_CSV} ({len(wix_net_rows)} rows)")
 
     # ----- aging state -----
     state_cols = ["job_key","company","source","title","location","url","first_seen_utc","last_seen_utc"]

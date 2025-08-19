@@ -47,11 +47,14 @@ DEFAULT_BLOCKLIST = [
     "subscribe", "sign up", "follow us", "news", "events",
     "sales event", "promotion", "coupon", "contest", "sweepstakes",
     "blog", "press",
+
     # footer/legal/junk
     "accessibility statement", "terms of use", "all rights reserved",
     "powered by", "copyright", "©",
+
     # application prompts
-    "employment application", "download", "application", "apply online"
+    "employment application", "download application", "apply online",
+    "apply here", "print application"
 ]
 
 def load_blocklist() -> list[str]:
@@ -71,11 +74,11 @@ BLOCKLIST = load_blocklist()
 PHONE_RE = re.compile(r'\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})\b')
 EMAIL_RE = re.compile(r'\b\S+@\S+\.\S+\b')
 URL_RE = re.compile(r'https?://|www\.')
-UPPER_RE = re.compile(r'^[^a-z]*$')  # title has no lowercase letters
+UPPER_RE = re.compile(r'^[^a-z]*$')  # no lowercase letters
 
 def is_titlecase_like(title: str) -> bool:
     """
-    Accept if at least ~50% of words are Title Case or acronyms (e.g., CDL).
+    Accept if at least ~50% of words are Title Case or acronyms (CDL/HVAC).
     Helps keep 'Sales Position', 'Boom Truck Driver' and reject long sentences.
     """
     words = [w for w in re.split(r'\s+', title) if w]
@@ -83,9 +86,8 @@ def is_titlecase_like(title: str) -> bool:
         return False
 
     def ok(w: str) -> bool:
-        if re.fullmatch(r'[A-Z]{2,5}', w):  # acronyms like CDL, HVAC
+        if re.fullmatch(r'[A-Z]{2,5}', w):  # CDL, HVAC
             return True
-        # "Title-Case" or Title-Case hyphenated
         return re.fullmatch(r'[A-Z][a-z]+(?:-[A-Z][a-z]+)?', w) is not None
 
     hits = sum(1 for w in words if ok(w))
@@ -93,8 +95,7 @@ def is_titlecase_like(title: str) -> bool:
 
 def filter_with_reason(title: str, description: str = "") -> tuple[bool, str]:
     """
-    Return (keep, reason_if_rejected).
-    Blocklist-first + structural checks (no required job keywords).
+    Blocklist-first + structural checks.
     """
     title = (title or "").strip()
     desc = (description or "").strip()
@@ -126,7 +127,7 @@ def filter_with_reason(title: str, description: str = "") -> tuple[bool, str]:
         if phrase in tl or phrase in dl:
             return (False, f"block:{phrase}")
 
-    # requirement-only lines like "CDL Required"
+    # requirement-only lines like "CDL Required" or "Experience Required"
     if "required" in tl and len(title.split()) <= 3:
         return (False, "requirement_only")
 
@@ -136,22 +137,26 @@ def filter_with_reason(title: str, description: str = "") -> tuple[bool, str]:
 
     return (True, "")
 
-def keep_row(title: str, description: str = "", record_rejection=None):
+def keep_row(title: str, description: str = "", record_rejection=None) -> bool:
     keep, reason = filter_with_reason(title, description)
     if not keep and record_rejection is not None:
         record_rejection(title, description, reason)
     return keep
 
-# ------------------ WIX helpers (stricter) ------------------
+# ------------------ WIX helpers (tight) ------------------
 VERB_STOPWORDS = {
     "apply", "click", "join", "subscribe", "sign", "learn", "contact",
     "visit", "shop", "buy", "call", "email", "download", "view", "read", "follow"
 }
 
-def _wix_find_relevant_section(page) -> list:
+ROLE_HINTS = {"driver","sales","yard","counter","associate","technician","foreman",
+              "laborer","warehouse","estimator","designer","manager","supervisor",
+              "cdl","delivery","purchasing","millwork","inside sales","outside sales"}
+
+def _wix_find_relevant_sections(page) -> list:
     """
-    Find container mentioning careers/employment/positions to reduce noise
-    (nav/footer/newsletter). Falls back to entire page if none found.
+    Find containers that mention careers/employment/positions to reduce noise
+    (nav/footer/newsletter). Fallback to whole page if none found.
     """
     signals = ["career", "careers", "employment", "jobs", "now hiring", "open positions", "positions", "apply"]
     containers = page.query_selector_all("main, section, div") or []
@@ -167,27 +172,30 @@ def _wix_find_relevant_section(page) -> list:
         if score:
             ranked.append((score, el))
     ranked.sort(key=lambda x: x[0], reverse=True)
-    return [el for _, el in ranked[:2]] or [page]  # top 1-2 relevant, else whole page
+    return [el for _, el in ranked[:3]] or [page]  # top 1-3 relevant, else whole page
 
 def _looks_like_job_title(line: str) -> bool:
     """
     Pre-filter for Wix candidates before full filtering:
-    - 2..8 words
+    - 2..6 words
+    - <= 48 chars
     - not all-caps short headers
     - no obvious CTA verbs at start
-    - contains at least one lowercase or TitleCase pattern
+    - has lowercase or TitleCase pattern
     """
     if not line:
         return False
-    words = [w for w in re.split(r'\s+', line.strip()) if w]
-    if len(words) < 2 or len(words) > 8:
+    line = line.strip()
+    if len(line) > 48:
+        return False
+    words = [w for w in re.split(r'\s+', line) if w]
+    if len(words) < 2 or len(words) > 6:
         return False
     if UPPER_RE.match(line) and len(words) <= 3:
         return False
-    first = words[0].lower().strip(":,.-")
+    first = words[0].lower().strip(":,.-/")
     if first in VERB_STOPWORDS:
         return False
-    # must have some lowercase or TitleCase feel
     if not any(ch.islower() for ch in line) and not re.search(r'\b[A-Z][a-z]+', line):
         return False
     return True
@@ -212,7 +220,6 @@ def scrape_indeed(page, company: str) -> list[dict]:
             href = c.get_attribute("href") or ""
             link = "https://www.indeed.com" + href if href.startswith("/") else href
             title = normalize_space(t.inner_text()) if t else ""
-            company_final = normalize_space(comp.inner_text()) if comp else company
             location = normalize_space(loc.inner_text()) if loc else ""
             if title:
                 jobs.append({
@@ -229,21 +236,20 @@ def scrape_indeed(page, company: str) -> list[dict]:
 
 def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
     """
-    Wix scraper: restrict scope, extract headings/list items/link text,
-    pre-filter candidates, then apply full filter with reasons.
+    Wix scraper: restrict scope, extract headings/list items/link text only,
+    pre-filter candidates, then apply central filter later.
     """
     print(f"🌐 Wix → {company} → {url}")
     raw: list[dict] = []
     page.goto(url, timeout=60000)
     time.sleep(5)
 
-    scopes = _wix_find_relevant_section(page)
+    scopes = _wix_find_relevant_sections(page)
     selectors = [
         "h1", "h2", "h3", "h4",
         "ul li", "ol li",
-        "[data-hook='richTextElement'] p",
-        "[data-testid='richTextElement'] p",
         "a[data-testid='linkElement'] span",
+        "a[role='link'] span",
     ]
 
     for scope in scopes:
@@ -256,21 +262,40 @@ def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
                     txt = ""
                 if not txt:
                     continue
-                # Only consider first line of block
                 line = txt.split("\n")[0].strip()
-                if not line:
+                if not _looks_like_job_title(line):
                     continue
-                if _looks_like_job_title(line):
-                    raw.append({
-                        "company": company,
-                        "source": "Website (Wix)",
-                        "title": line,
-                        "location": "",
-                        "url": url,
-                        "description": txt[:400]
-                    })
+                raw.append({
+                    "company": company,
+                    "source": "Website (Wix)",
+                    "title": line,
+                    "location": "",
+                    "url": url,
+                    "description": txt[:400]
+                })
 
-    print(f"   wix pre-filtered candidates: {len(raw)}")
+    # Fallback: if we found nothing, scan headings again and keep ones with role hints
+    if not raw:
+        headings = page.query_selector_all("h1, h2, h3, h4") or []
+        for h in headings:
+            try:
+                line = (h.inner_text() or "").strip()
+            except:
+                line = ""
+            if not line:
+                continue
+            lo = line.lower()
+            if any(w in lo for w in ROLE_HINTS) and _looks_like_job_title(line):
+                raw.append({
+                    "company": company,
+                    "source": "Website (Wix)",
+                    "title": line,
+                    "location": "",
+                    "url": url,
+                    "description": line
+                })
+
+    print(f"   wix candidates: {len(raw)}")
     return raw  # final filtering happens centrally
 
 def scrape_custom_static(page, url: str, company: str,
@@ -437,18 +462,14 @@ def run_all():
                 j = {k: v for k, v in j.items() if k != "description"}
             filtered.append(j)
 
-    # Save outputs
+    # Save outputs (always create the files)
     pd.DataFrame(filtered).to_csv(POSTINGS_CSV, index=False)
     pd.DataFrame(rejections).to_csv(REJECTIONS_CSV, index=False)
-    if wix_debug_rows:
-        pd.DataFrame(wix_debug_rows).to_csv(DEBUG_WIX_CSV, index=False)
-    else:
-        # always create the debug file for consistency
-        pd.DataFrame(columns=["company","url","candidate","snippet"]).to_csv(DEBUG_WIX_CSV, index=False)
+    pd.DataFrame(wix_debug_rows).to_csv(DEBUG_WIX_CSV, index=False)
 
     print(f"✅ Wrote {len(filtered)} filtered rows (from {len(uniq)} raw) → {POSTINGS_CSV}")
-    print(f"🧹 Rejections saved → {REJECTIONS_CSV}")
-    print(f"🔍 Wix candidates saved → {DEBUG_WIX_CSV}")
+    print(f"🧹 Rejections saved → {REJECTIONS_CSV} ({len(rejections)} rows)")
+    print(f"🔍 Wix candidates saved → {DEBUG_WIX_CSV} ({len(wix_debug_rows)} rows)")
 
     # ----- aging state -----
     state_cols = ["job_key","company","source","title","location","url","first_seen_utc","last_seen_utc"]

@@ -19,7 +19,7 @@ jobs:
 
       - name: Install deps (Playwright + libs)
         run: |
-          pip install -r requirements.txt
+          pip install pandas playwright python-dateutil
           playwright install --with-deps chromium
 
       - name: Build loadsheet from dealers_input.csv
@@ -37,3 +37,5 @@ jobs:
             outputs/job_postings.csv
             outputs/state.csv
             outputs/aged_jobs.csv
+            outputs/rejections.csv
+            outputs/debug_wix_candidates.csv

@@ -15,6 +15,7 @@ POSTINGS_CSV = os.path.join(OUT_DIR, "job_postings.csv")
 STATE_CSV = os.path.join(OUT_DIR, "state.csv")
 AGED_CSV = os.path.join(OUT_DIR, "aged_jobs.csv")
 REJECTIONS_CSV = os.path.join(OUT_DIR, "rejections.csv")
+DEBUG_WIX_CSV = os.path.join(OUT_DIR, "debug_wix_candidates.csv")
 
 # ------------------ utils ------------------
 def ensure_dirs():
@@ -46,17 +47,14 @@ DEFAULT_BLOCKLIST = [
     "subscribe", "sign up", "follow us", "news", "events",
     "sales event", "promotion", "coupon", "contest", "sweepstakes",
     "blog", "press",
-
     # footer/legal/junk
     "accessibility statement", "terms of use", "all rights reserved",
     "powered by", "copyright", "©",
-
     # application prompts
     "employment application", "download", "application", "apply online"
 ]
 
 def load_blocklist() -> list[str]:
-    """Merge defaults with optional config/blocklist.txt (one phrase per line)."""
     merged = set(DEFAULT_BLOCKLIST)
     user_file = os.path.join(CONFIG_DIR, "blocklist.txt")
     if os.path.exists(user_file):
@@ -128,12 +126,12 @@ def filter_with_reason(title: str, description: str = "") -> tuple[bool, str]:
         if phrase in tl or phrase in dl:
             return (False, f"block:{phrase}")
 
-    # requirement-only lines like "CDL Required", "Experience Required"
+    # requirement-only lines like "CDL Required"
     if "required" in tl and len(title.split()) <= 3:
         return (False, "requirement_only")
 
     # shape: if it's not title-like and it's long, reject
-    if not is_titlecase_like(title) and len(title.split()) > 5:
+    if not is_titlecase_like(title) and len(title.split()) > 6:
         return (False, "not_title_like")
 
     return (True, "")
@@ -143,6 +141,56 @@ def keep_row(title: str, description: str = "", record_rejection=None):
     if not keep and record_rejection is not None:
         record_rejection(title, description, reason)
     return keep
+
+# ------------------ WIX helpers (stricter) ------------------
+VERB_STOPWORDS = {
+    "apply", "click", "join", "subscribe", "sign", "learn", "contact",
+    "visit", "shop", "buy", "call", "email", "download", "view", "read", "follow"
+}
+
+def _wix_find_relevant_section(page) -> list:
+    """
+    Find container mentioning careers/employment/positions to reduce noise
+    (nav/footer/newsletter). Falls back to entire page if none found.
+    """
+    signals = ["career", "careers", "employment", "jobs", "now hiring", "open positions", "positions", "apply"]
+    containers = page.query_selector_all("main, section, div") or []
+    ranked = []
+    for el in containers:
+        try:
+            txt = (el.inner_text() or "").lower()
+        except:
+            txt = ""
+        if not txt:
+            continue
+        score = sum(1 for s in signals if s in txt)
+        if score:
+            ranked.append((score, el))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [el for _, el in ranked[:2]] or [page]  # top 1-2 relevant, else whole page
+
+def _looks_like_job_title(line: str) -> bool:
+    """
+    Pre-filter for Wix candidates before full filtering:
+    - 2..8 words
+    - not all-caps short headers
+    - no obvious CTA verbs at start
+    - contains at least one lowercase or TitleCase pattern
+    """
+    if not line:
+        return False
+    words = [w for w in re.split(r'\s+', line.strip()) if w]
+    if len(words) < 2 or len(words) > 8:
+        return False
+    if UPPER_RE.match(line) and len(words) <= 3:
+        return False
+    first = words[0].lower().strip(":,.-")
+    if first in VERB_STOPWORDS:
+        return False
+    # must have some lowercase or TitleCase feel
+    if not any(ch.islower() for ch in line) and not re.search(r'\b[A-Z][a-z]+', line):
+        return False
+    return True
 
 # ------------------ platform scrapers ------------------
 def scrape_indeed(page, company: str) -> list[dict]:
@@ -179,47 +227,23 @@ def scrape_indeed(page, company: str) -> list[dict]:
     print(f"   indeed raw: {len(jobs)}")
     return jobs
 
-def _wix_find_relevant_section(page) -> list:
-    """
-    Heuristic: find the first container that mentions careers/employment/positions,
-    then search only inside it to reduce noise like footers, nav, newsletter.
-    """
-    signals = ["career", "careers", "employment", "jobs", "now hiring", "open positions", "positions", "apply"]
-    containers = page.query_selector_all("section, div, main") or []
-    for el in containers:
-        try:
-            txt = (el.inner_text() or "").lower()
-        except:
-            txt = ""
-        if not txt:
-            continue
-        if any(s in txt for s in signals):
-            return [el]
-    return []
-
 def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
     """
-    Wix scraper: limit scope to a relevant section, then collect candidate titles from
-    headings (h1..h6), list items, and short paragraphs/links; apply strict filters later.
+    Wix scraper: restrict scope, extract headings/list items/link text,
+    pre-filter candidates, then apply full filter with reasons.
     """
     print(f"🌐 Wix → {company} → {url}")
-    jobs: list[dict] = []
+    raw: list[dict] = []
     page.goto(url, timeout=60000)
-    time.sleep(5)  # allow JS to render
+    time.sleep(5)
 
-    # 1) Restrict to relevant section(s)
     scopes = _wix_find_relevant_section(page)
-    if not scopes:
-        scopes = [page]  # fallback: whole page (filters will clean)
-
-    # 2) Within scope, gather candidate elements
     selectors = [
         "h1", "h2", "h3", "h4",
         "ul li", "ol li",
         "[data-hook='richTextElement'] p",
         "[data-testid='richTextElement'] p",
         "a[data-testid='linkElement'] span",
-        "p"
     ]
 
     for scope in scopes:
@@ -232,23 +256,22 @@ def scrape_wix_generic(page, url: str, company: str) -> list[dict]:
                     txt = ""
                 if not txt:
                     continue
-
-                # Consider only the first line of multi-line blocks here
+                # Only consider first line of block
                 line = txt.split("\n")[0].strip()
                 if not line:
                     continue
+                if _looks_like_job_title(line):
+                    raw.append({
+                        "company": company,
+                        "source": "Website (Wix)",
+                        "title": line,
+                        "location": "",
+                        "url": url,
+                        "description": txt[:400]
+                    })
 
-                jobs.append({
-                    "company": company,
-                    "source": "Website (Wix)",
-                    "title": line,
-                    "location": "",
-                    "url": url,
-                    "description": txt[:400]
-                })
-
-    print(f"   wix raw candidates: {len(jobs)}")
-    return jobs
+    print(f"   wix pre-filtered candidates: {len(raw)}")
+    return raw  # final filtering happens centrally
 
 def scrape_custom_static(page, url: str, company: str,
                          sel_card: str, sel_title: str, sel_loc: str, sel_link: str) -> list[dict]:
@@ -343,6 +366,7 @@ def run_all():
 
     sources = pd.read_csv(LOADSHEET).fillna("")
     raw_rows: list[dict] = []
+    wix_debug_rows = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -361,7 +385,16 @@ def run_all():
                 if stype == "indeed":
                     raw_rows += scrape_indeed(page, company)
                 elif stype == "wix_generic":
-                    raw_rows += scrape_wix_generic(page, url, company)
+                    wix_candidates = scrape_wix_generic(page, url, company)
+                    raw_rows += wix_candidates
+                    # keep candidates for debug
+                    for c in wix_candidates:
+                        wix_debug_rows.append({
+                            "company": company,
+                            "url": url,
+                            "candidate": c.get("title",""),
+                            "snippet": c.get("description","")
+                        })
                 elif stype == "custom_static":
                     raw_rows += scrape_custom_static(page, url, company, sc, st, sl, slink)
                 elif stype == "lever":
@@ -391,7 +424,7 @@ def run_all():
         rejections.append({
             "title": title,
             "reason": reason,
-            "snippet": (description or "")[:200]
+            "snippet": (description or "")[:250]
         })
 
     filtered = []
@@ -399,7 +432,7 @@ def run_all():
         title = j.get("title", "")
         desc = j.get("description", "")
         if keep_row(title, desc, record_rejection):
-            # drop the temporary description field from final CSV if present
+            # drop temporary description field from final CSV
             if "description" in j:
                 j = {k: v for k, v in j.items() if k != "description"}
             filtered.append(j)
@@ -407,8 +440,15 @@ def run_all():
     # Save outputs
     pd.DataFrame(filtered).to_csv(POSTINGS_CSV, index=False)
     pd.DataFrame(rejections).to_csv(REJECTIONS_CSV, index=False)
+    if wix_debug_rows:
+        pd.DataFrame(wix_debug_rows).to_csv(DEBUG_WIX_CSV, index=False)
+    else:
+        # always create the debug file for consistency
+        pd.DataFrame(columns=["company","url","candidate","snippet"]).to_csv(DEBUG_WIX_CSV, index=False)
+
     print(f"✅ Wrote {len(filtered)} filtered rows (from {len(uniq)} raw) → {POSTINGS_CSV}")
     print(f"🧹 Rejections saved → {REJECTIONS_CSV}")
+    print(f"🔍 Wix candidates saved → {DEBUG_WIX_CSV}")
 
     # ----- aging state -----
     state_cols = ["job_key","company","source","title","location","url","first_seen_utc","last_seen_utc"]
